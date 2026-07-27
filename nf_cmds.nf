@@ -1,15 +1,26 @@
 #!/usr/bin/env nextflow
 /*
 Nextflow pipeline for outbreak detection of bacterial isolates from Illumina short-read data
-Usage: nextflow run nf_cmds.nf --sra_list sra.txt --input-dir ./input --config nf_cmds.config
+Basic Usage: nextflow run nf_cmds.nf --sra_list sra.txt --input-dir ./input --config nf_cmds.config
+
+    Reads can come from an sra.txt of accessions to download, a local
+    input/ directory of fastq.gz read pairs, or both at once.
+
+Additional parameters:
+--run_16S_id true
+    16S rRNA identification is an optional branch 
+    fragile for fragmented short-read assemblies
+    Default: off (params.run_16S_id = false)
+
+--mash_db_dir /path/to/mash
+    If you already have a mash directory, you can point to it with --mash_db_dir /path/to/mash
+
+
 */
 
 params.sra_list = './sra.txt'
 params.input_dir = './input'
 params.mash_db_dir = "${projectDir}/data/mash"
-// 16S rRNA identification is fragile for fragmented short-read assemblies
-// so it's kept as an optional, informational side-branch; 
-// Mash against the whole assembly is the primary genus/species identification method.
 params.run_16S_id = false
 
 process downloadSRA {
@@ -22,11 +33,8 @@ process downloadSRA {
 
     script:
     """
-    echo "Fetching accession ${sra_name}..."
     #get accessions from ncbi 
     prefetch "${sra_name}"
-    echo "Fetching accession ${sra_name} complete."
-
     """
 }
 
@@ -40,7 +48,6 @@ process convertSRA {
 
     script:
     """
-    echo "Converting to ${input_sra} fastq..."
     # convert to all sra files to fastq files
     fasterq-dump \
     "${input_sra}" \
@@ -50,7 +57,6 @@ process convertSRA {
 
     # compress
     pigz -9 *.fastq
-    echo "Converting ${input_sra} complete."
     """
 }
 
@@ -66,7 +72,6 @@ process cleanFastq {
 
     script:
     """
-    echo "Cleaning ${sample_id}..."
     # Clean with fastp
     fastp \
     -i "${r1}" \
@@ -75,7 +80,6 @@ process cleanFastq {
     -O "${sample_id}.R2.fq.gz" \
     --json "${sample_id}.json" \
     --html "${sample_id}.html"
-    echo "Cleaning ${sample_id} complete."
     """
 }
 
@@ -90,14 +94,12 @@ process assembleGenome {
 
     script:
     """
-    echo "Assembling ${sample_id}..."
     # Assemble with skesa
     skesa \
     --reads "${r1}","${r2}" \
     --cores 4 \
     --min_contig 1000 \
     --contigs_out "${sample_id}".fna
-    echo "Assembling ${sample_id} complete."
     """
 }
 
@@ -112,11 +114,9 @@ process fastqMetrics {
 
     script:
     """
-    echo "Computing fastq stats for ${sample_id}..."
     #-a All Statistics (including N50, Q30)
     #-b grabs basename
     seqkit stats -a -b "${r1}" "${r2}" > "${sample_id}_stats.tsv"
-    echo "Computing fastq stats for ${sample_id} complete."
     """
 }
 
@@ -175,10 +175,8 @@ process extract16S {
 
     script:
     """
-    #identify the 16S rRNA gene sequence coordinates (GFF format)
-    #short-read assemblies often fragment multi-copy rRNA operons, so a
-    #default-threshold barrnap run can legitimately find zero 16S hits;
-    #`|| true` stops grep's no-match exit (1) from killing the script here
+    #identify the 16S rRNA gene sequence coordinates (GFF format) with barrnap
+    #`|| true` stops grep's no-match exit (1) from killing the script if finds zero hits
     barrnap \
     "${assembly}" \
     | grep "Name=16S_rRNA;product=16S ribosomal RNA" \
@@ -233,7 +231,7 @@ process genusIdentification {
 			-perc_identity 95 \
 			-max_target_seqs 10 \
 			-outfmt "6 stitle qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qcovs" | \
-		sed \$'s/ 16S ribosomal RNA[^\t]*/\t/'
+		sed \$'s/ 16S ribosomal RNA[^\t]*//'
 	} > "${sample_id}_16S_rRNA_blastn.tsv"
     """
 }
@@ -260,6 +258,189 @@ process readGenusIdentification {
     """
 }
 
+process genusRefList {
+    debug true
+    input:
+    tuple val(sample_id), val(genus)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_ref_genomes/*.fna")
+
+    script:
+    """
+    ## Fetch reference genomes for the 16S-identified genus for use by FastANI.
+    ## --reference caps this to ~one curated genome per species
+    datasets download genome taxon "${genus}" \
+    --reference \
+    --assembly-level complete \
+    --filename "${sample_id}-genus_refs.zip"
+
+    unzip "${sample_id}-genus_refs.zip"
+
+    mkdir -p "${sample_id}_ref_genomes"
+    find ncbi_dataset/data/ -name "*.fna" -exec cp {} "${sample_id}_ref_genomes/" \\;
+    """
+}
+
+process speciesIdentification {
+    debug true
+    input:
+    tuple val(sample_id), path(assembly), path(ref_genomes)
+
+    output:
+    tuple val(sample_id), path("${sample_id}-fastani.tsv")
+
+    script:
+    """
+    # list the staged reference genomes for FastANI
+    ls ${ref_genomes} > "${sample_id}-ref_list.txt"
+
+    # identify species based on FastANI
+    fastani \
+            --query "${assembly}" \
+            --rl "${sample_id}-ref_list.txt" --threads 8 \
+            --output "${sample_id}-fastani_output.tsv" \
+            > "${sample_id}-fastani.log" 2>&1
+
+    # add alignment percent and alignment length to FastANI output
+    awk \
+    '{alignment_percent = \$4/\$5*100} \
+    {alignment_length = \$4*3000} \
+    {print \$0 "\t" alignment_percent "\t" alignment_length}' \
+    "${sample_id}-fastani_output.tsv" \
+    > "${sample_id}-fastani_with_alignment.tsv"
+
+    # add header
+    awk 'BEGIN \
+    {print "Query\tReference\t%ANI\tNum_Fragments_Mapped\tTotal_Query_Fragments\t%Query_Aligned\tBasepairs_Query_Aligned"} \
+    {print}' \
+    "${sample_id}-fastani_with_alignment.tsv" \
+    > "${sample_id}-fastani.tsv"
+    """
+}
+
+process readSpeciesIdentification {
+    debug true
+    input:
+    tuple val(sample_id), path(fastani_results)
+
+    output:
+    tuple val(sample_id), stdout
+
+    script:
+    """
+    #!/usr/bin/env python3
+    ## Read the FastANI results and identify the species based on the top hit
+
+    import pandas as pd
+    import re
+    import subprocess
+
+    df = pd.read_csv("${fastani_results}", sep='\t')
+    top_hit = df.sort_values('%ANI', ascending=False).iloc[0]
+
+    # FastANI's Reference column is the reference genome filename
+    # not a species name so look up organism name from its assembly accession via NCBI datasets
+
+    accession = re.match(r'(GC[AF]_\\d+\\.\\d+)', top_hit['Reference']).group(1)
+
+    result = subprocess.run(
+        f"datasets summary genome accession {accession} --as-json-lines | "
+        "dataformat tsv genome --fields organism-name",
+        shell=True, capture_output=True, text=True, check=True
+    )
+    species = result.stdout.strip().split('\\n')[-1]
+
+    print(species, end='')
+    """
+}
+
+process combine16SSequences {
+    debug true
+    input:
+    path(fastas)
+
+    output:
+    path("16S_sequences.fasta")
+
+    script:
+    """
+    cat ${fastas} > 16S_sequences.fasta
+    """
+}
+
+process align16SSequences {
+    debug true
+    input:
+    path(sequences)
+
+    output:
+    path("16S_aligned.fasta")
+
+    script:
+    """
+    # align 16S sequences with MAFFT
+
+    n_seqs=\$(grep -c "^>" "${sequences}")
+    if [ "\$n_seqs" -lt 2 ]; then
+        echo "Only \$n_seqs 16S sequence(s) available; need at least 2 to align." >&2
+        cp "${sequences}" 16S_aligned.fasta
+    else
+        mafft --auto --adjustdirection --thread 4 "${sequences}" > 16S_aligned.fasta
+    fi
+    """
+}
+
+process build16STree {
+    debug true
+    input:
+    path(alignment)
+
+    output:
+    path("16S_tree.treefile")
+
+    script:
+    """
+    # build a 16S rRNA phylogenetic tree with IQ-TREE2
+
+    n_seqs=\$(grep -c "^>" "${alignment}")
+    if [ "\$n_seqs" -lt 3 ]; then
+        echo "Only \$n_seqs 16S sequence(s) available; IQ-TREE needs at least 3 for a meaningful tree." >&2
+        echo "(no tree: only \$n_seqs 16S sequence(s) available)" > 16S_tree.treefile
+    else
+        iqtree2 \
+            -s "${alignment}" \
+            -m MFP \
+            -alrt 1000 \
+            -bb 1000 \
+            -nt AUTO \
+            -pre 16S_tree \
+            -redo
+    fi
+    """
+}
+
+process render16STree {
+    debug true
+    input:
+    path(tree)
+
+    output:
+    path("16S_tree.svg")
+
+    script:
+    """
+    # render the 16S tree as an SVG for easy viewing 
+
+    if grep -q "^(no tree" "${tree}"; then
+        echo '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="40">' > 16S_tree.svg
+        echo '<text x="10" y="20" font-family="sans-serif" font-size="12">'"\$(cat "${tree}")"'</text></svg>' >> 16S_tree.svg
+    else
+        figtree -graphic SVG "${tree}" 16S_tree.svg
+    fi
+    """
+}
+
 process downloadMashDB {
     debug true
     storeDir params.mash_db_dir
@@ -270,10 +451,10 @@ process downloadMashDB {
 
     script:
     """
-    echo "Downloading pre-sketched NCBI RefSeq genome database (~750MB)..."
+    echo "Downloading pre-sketched NCBI RefSeq genome database (~750MB)"
     curl -LO https://gembox.cbcb.umd.edu/mash/refseq.genomes.k21s1000.msh
 
-    echo "Downloading RefSeq bacterial assembly summary (~200MB)..."
+    echo "Downloading RefSeq bacterial assembly summary (~200MB)"
     curl -LO https://ftp.ncbi.nlm.nih.gov/genomes/refseq/bacteria/assembly_summary.txt
     """
 }
@@ -289,7 +470,8 @@ process mashIdentification {
     script:
     """
     # Mash compares the whole assembly against a local RefSeq sketch database,
-    # so it's robust to genomes where a specific gene (eg. 16S) didn't assemble
+    # ie it's robust to genomes where a specific gene (eg. 16S) didn't assemble
+
     mash sketch -m 2 "${assembly}"
     mash dist "${mash_sketch}" "${assembly}.msh" | sort -gk3 | head -n 10 > "${sample_id}_microbial_distances.tsv"
     mash screen "${mash_sketch}" "${assembly}" | sort -gr > "${sample_id}_microbial_screen.tsv"
@@ -371,8 +553,7 @@ process genotyping {
 
     script:
     """
-    # mlst's own BLAST-based scheme detection is reliable on its own; genus/species
-    # (from Mash) are recorded here for traceability but not forced as --scheme
+    # genus/species from mash are recorded here but not forced with --scheme
     echo "Mash-identified organism for ${sample_id}: ${species} (genus: ${genus})"
     mlst \
         "${assembly}" \
@@ -417,17 +598,19 @@ process contigQA{
 
     script:
     """
-    # DEBUG RUN: using GUNC's small 'test_data' database instead of the real
-    # ~7GB progenomes_2.1 database, to validate this step without a huge
-    # download. For production use, switch back to the full database:
-    # `gunc download_db data/gunc` (no -db flag) and --db
-    # data/gunc/gunc_db_progenomes2.1.dmnd below.
+    # For full use, switch back to the full database:
+        # if [[ ! -f "data/gunc/ci_test.dmnd" ]] → if [[ ! -f "data/gunc/gunc_db_progenomes2.1.dmnd" ]]
+        #gunc download_db data/gunc -db test_data → gunc download_db data/gunc
+
     if [[ ! -f "data/gunc/ci_test.dmnd" ]]; then
 	mkdir -p data/gunc
 	gunc download_db data/gunc -db test_data
     fi
 
     # run GUNC on the assembly; output is a directory with a tsv per sample
+    # For full use, switch back to the full database:
+    # --db "data/gunc/ci_test.dmnd" → --db "data/gunc/gunc_db_progenomes2.1.dmnd"
+
     mkdir -p "${sample_id}_gunc_out"
     gunc run \
 		--input_fasta "${assembly}" \
@@ -443,34 +626,30 @@ process contigQA{
 
 process phylogeneticAnalysis {
     debug true
-    // parsnp has no native osx-arm64 conda build; runs via Docker instead
-    // (amd64 image, transparently emulated by Docker Desktop on Apple Silicon)
+    // parsnp runs via Docker amd64 image, transparently emulated by Docker Desktop on Apple Silicon.
     container 'staphb/parsnp:1.5.6'
     containerOptions '--platform linux/amd64'
 
     input:
-    // grouped by genus (see workflow) so a tree only ever compares taxonomically
-    // related samples - mixing distant genera makes parsnp silently drop the
-    // poorly-aligning genome from the tree instead of erroring
+    // grouped by genus so a tree only ever compares taxonomically related samples
     tuple val(genus), path(assemblies)
 
     output:
-    tuple val(genus), path("${genus}-parsnp.tree")
+    tuple val(genus), path("${genus}-parsnp.tree"), path("${genus}-core_alignment.fasta")
 
     script:
     """
     mkdir -p parsnp_input_assemblies
     cp ${assemblies} parsnp_input_assemblies/
 
-    # RAxML (parsnp's ML tree builder, used whenever there are enough real SNPs)
-    # hard-fails below 3 taxa ("TOO FEW SPECIES") - a 2-leaf tree has no real
-    # topology to infer anyway, so treat < 3 genomes like the singleton case
+    # a core-genome ML tree needs at least 3 taxa for a real topology
     n_genomes=\$(ls parsnp_input_assemblies | wc -l)
     if [ "\$n_genomes" -lt 3 ]; then
-        echo "Only \$n_genomes genome(s) identified as ${genus}; Parsnp/RAxML need at least 3 to build a comparative tree." >&2
+        echo "Only \$n_genomes genome(s) identified as ${genus}; need at least 3 to build a comparative tree." >&2
         echo "(no tree: only \$n_genomes sample(s) identified as ${genus})" > "${genus}-parsnp.tree"
+        echo "(no alignment: only \$n_genomes sample(s) identified as ${genus})" > "${genus}-core_alignment.fasta"
     else
-        # run Parsnp to generate a core SNP phylogenetic tree from all samples of this genus
+        # run Parsnp to align all samples of this genus and generate a core genome
         parsnp \
         -d parsnp_input_assemblies \
         -r ! \
@@ -478,6 +657,41 @@ process phylogeneticAnalysis {
         -p 4
 
         cp parsnp_outdir/parsnp.tree "${genus}-parsnp.tree"
+
+        # extract the core-genome alignment (concatenated LCBs) from parsnp's
+        # Harvest archive, for buildCoreGenomeTree to run IQ-TREE2 on
+        harvesttools -i parsnp_outdir/parsnp.ggr -M "${genus}-core_alignment.fasta"
+    fi
+    """
+}
+
+process buildCoreGenomeTree {
+    debug true
+
+    input:
+    tuple val(genus), path(parsnp_tree), path(alignment)
+
+    output:
+    tuple val(genus), path("${genus}-core_genome.treefile")
+
+    script:
+    """
+    # harvesttools ships in the same image as phylogeneticAnalysis 
+    # genome tree and the 16S tree are built with the same methodology
+    # so are actually comparable to each other.
+
+    # use iqtree2 to build a core-genome tree from the parsnp alignment 
+    if grep -q "^(no " "${parsnp_tree}"; then
+        cp "${parsnp_tree}" "${genus}-core_genome.treefile"
+    else
+        iqtree2 \
+            -s "${alignment}" \
+            -m MFP \
+            -alrt 1000 \
+            -bb 1000 \
+            -nt AUTO \
+            -pre "${genus}-core_genome" \
+            -redo
     fi
     """
 }
@@ -488,15 +702,16 @@ process renderPhylogeneticTree {
     tuple val(genus), path(tree)
 
     output:
-    tuple val(genus), path("${genus}-parsnp.svg")
+    tuple val(genus), path("${genus}-core_genome.svg")
 
     script:
     """
-    if grep -q "^(no tree" "${tree}"; then
-        echo '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="40">' > "${genus}-parsnp.svg"
-        echo '<text x="10" y="20" font-family="sans-serif" font-size="12">'"\$(cat "${tree}")"'</text></svg>' >> "${genus}-parsnp.svg"
+    # render the core-genome tree as an SVG
+    if grep -q "^(no " "${tree}"; then
+        echo '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="40">' > "${genus}-core_genome.svg"
+        echo '<text x="10" y="20" font-family="sans-serif" font-size="12">'"\$(cat "${tree}")"'</text></svg>' >> "${genus}-core_genome.svg"
     else
-        figtree -graphic SVG "${tree}" "${genus}-parsnp.svg"
+        figtree -graphic SVG "${tree}" "${genus}-core_genome.svg"
     fi
     """
 }
@@ -548,9 +763,6 @@ process combineSummaryReports {
 workflow {
 
     main:
-    // Reads can come from an sra.txt of accessions to download, a local
-    // input/ directory of fastq.gz read pairs, or both at once - whichever
-    // of the two sources is actually present gets used.
     def sra_list_file = file(params.sra_list)
     def input_dir = file(params.input_dir)
 
@@ -590,7 +802,7 @@ workflow {
         local_read_pairs_ch = channel.empty()
     }
 
-    // clean fastq files (both sources go through the same cleaning step)
+    // clean fastq files
     cleanFastq(sra_read_pairs_ch.mix(local_read_pairs_ch))
     // [0] selects only the tuple (r1, r2), not the json/html outputs
     read_pairs_ch = cleanFastq.out[0]
@@ -607,26 +819,45 @@ workflow {
     // gene annotation
     genePrediction(filterContigs.out)
 
-    // optional 16S rRNA identification (informational only, off by default -
-    // see params.run_16S_id). Doesn't feed genotyping or the final summary;
-    // Mash below is the primary genus/species identification method.
+    // optional 16S rRNA identification
     if (params.run_16S_id) {
         extract16S(filterContigs.out)
         genusIdentification(extract16S.out.fasta)
         readGenusIdentification(genusIdentification.out)
+
+        // 16S BLASTn alone only resolves genus; confirm species via FastANI
+        // against reference genomes for that genus
+        genusRefList(readGenusIdentification.out)
+        speciesIdentification(filterContigs.out.join(genusRefList.out))
+        readSpeciesIdentification(speciesIdentification.out)
+
+        // build a 16S rRNA phylogenetic tree across every sample that has one,
+        // regardless of genus (a 16S tree spans diverse taxa, so no per-genus grouping)
+        sixteenS_fasta_ch = extract16S.out.fasta.map { id, fasta -> fasta }.collect()
+        combine16SSequences(sixteenS_fasta_ch)
+        align16SSequences(combine16SSequences.out)
+        build16STree(align16SSequences.out)
+        render16STree(build16STree.out)
+
         sixteenS_gff_out = extract16S.out.gff
         sixteenS_blastn_out = genusIdentification.out
+        sixteenS_ref_genomes_out = genusRefList.out
+        sixteenS_fastani_out = speciesIdentification.out
+        sixteenS_tree_out = build16STree.out.mix(render16STree.out)
     } else {
         sixteenS_gff_out = channel.empty()
         sixteenS_blastn_out = channel.empty()
+        sixteenS_ref_genomes_out = channel.empty()
+        sixteenS_fastani_out = channel.empty()
+        sixteenS_tree_out = channel.empty()
     }
 
     // download/reuse the local Mash RefSeq sketch database (once for the whole run)
     downloadMashDB()
 
-    // identify genus+species per sample via Mash against the whole assembly -
-    // far more robust to fragmented assemblies than a single-gene BLAST, and
-    // avoids querying NCBI live for every sample
+    // identify genus and species per sample via Mash against the whole assembly
+    //  more robust to fragmented assemblies than a single-gene BLAST and
+    // avoids querying NCBI for every sample
     mash_input_ch = filterContigs.out
         .combine(downloadMashDB.out.sketch)
         .combine(downloadMashDB.out.summary)
@@ -660,12 +891,16 @@ workflow {
 
     phylogeneticAnalysis(genus_assembly_ch)
 
-    // render each genus's Newick tree to SVG (native arm64 conda; parsnp itself is Docker-only)
-    renderPhylogeneticTree(phylogeneticAnalysis.out)
+    // build the core-genome tree with IQ-TREE2 on parsnp's alignment, so this
+    // tree uses the same methodology as the 16S tree and the two are comparable
+    buildCoreGenomeTree(phylogeneticAnalysis.out)
+
+    // render each genus's Newick tree to SVG
+    renderPhylogeneticTree(buildCoreGenomeTree.out)
 
     // map each sample back to its own genus's tree, keyed by sample_id again
     // .join() only reliably pairs unique keys; genus isn't unique when multiple
-    // samples share it, so cross every sample against the (small) set of trees
+    // samples share it, so cross every sample against the set of trees
     // and filter to its own genus instead of joining on genus directly
     sample_tree_ch = genus_ch
         .combine(renderPhylogeneticTree.out)
@@ -698,8 +933,11 @@ workflow {
     tenth_output = genotyping.out
     eleventh_output = genomeQA.out
     twelfth_output = contigQA.out
-    thirteenth_output = phylogeneticAnalysis.out.mix(renderPhylogeneticTree.out)
+    thirteenth_output = phylogeneticAnalysis.out.mix(buildCoreGenomeTree.out).mix(renderPhylogeneticTree.out)
     fourteenth_output = combineSummaryReports.out
+    fifteenth_output = sixteenS_ref_genomes_out
+    sixteenth_output = sixteenS_fastani_out
+    seventeenth_output = sixteenS_tree_out
 }
 
 output {
@@ -770,6 +1008,21 @@ output {
 
     fourteenth_output {
         path 'summary_reports'
+        mode 'copy'
+    }
+
+    fifteenth_output {
+        path 'genus_ref_list'
+        mode 'copy'
+    }
+
+    sixteenth_output {
+        path 'species_identification'
+        mode 'copy'
+    }
+
+    seventeenth_output {
+        path '16S_tree'
         mode 'copy'
     }
 
